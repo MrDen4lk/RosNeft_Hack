@@ -32,19 +32,18 @@ class SegmentationDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         image = np.array(image)
 
-        # маска: В СЕРОМ, КАК У ТЕБЯ В ФАЙЛАХ
+        # маска
         mask_gray = Image.open(mask_path).convert("L")
-        mask_gray = np.array(mask_gray)          # (H, W), значения = твои gray_code
+        mask_gray = np.array(mask_gray)
 
-        # ПЕРЕВОДИМ В ИНДЕКСЫ КЛАССОВ 0..NUM_CLASSES-1
-        mask_idx = gray2class[mask_gray]        # (H, W)
+        # в индексы классов
+        mask_idx = gray2class[mask_gray]
 
         if self.transforms is not None:
             aug = self.transforms(image=image, mask=mask_idx)
-            image = aug["image"]                # [C, H, W], torch.float32
-            mask_idx = aug["mask"]              # [H, W] или [1, H, W]
+            image = aug["image"]
+            mask_idx = aug["mask"]
 
-        # для надёжности
         if isinstance(mask_idx, torch.Tensor):
             mask_idx = mask_idx.long()
 
@@ -54,7 +53,6 @@ class SegmentationDataset(Dataset):
 def _pair_paths(input_dir: Path, target_dir: Path) -> Tuple[List[Path], List[Path]]:
     """
     Собирает пары (input, target) по одинаковому имени файла.
-    Например: data/input/0.png  <->  data/target/0.png
     """
     image_paths = sorted(list(input_dir.glob("*.*")))  # png/jpg и т.п.
     paired_imgs = []
@@ -82,10 +80,6 @@ def create_train_val_datasets(
     Создаёт train и val датасеты из папок:
         {data_root}/input
         {data_root}/target
-
-    val_size      — доля валидации (0.2 = 20%)
-    random_state  — фиксируем сид, чтобы сплит был воспроизводим
-    transforms    — можно передать разные аугментации для train/val
     """
     data_root = Path(data_root)
     input_dir = data_root / "input"
@@ -103,7 +97,7 @@ def create_train_val_datasets(
         test_size=val_size,
         random_state=random_state,
         shuffle=True,
-        stratify=None,  # можно заменить на классовую разметку, если есть
+        stratify=None,
     )
 
     train_images = [images[i] for i in train_idx]
@@ -113,8 +107,5 @@ def create_train_val_datasets(
 
     train_ds = SegmentationDataset(train_images, train_masks, transforms=train_transforms)
     val_ds = SegmentationDataset(val_images, val_masks, transforms=val_transforms)
-
-    print(f"Total pairs: {len(images)}")
-    print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
     return train_ds, val_ds

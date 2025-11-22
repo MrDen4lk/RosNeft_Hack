@@ -1,7 +1,5 @@
 import numpy as np
 
-# Твои коды в градациях серого ДЛЯ КЛАССОВ (без фона).
-# Здесь просто пример – подставь реальные из Excel в нужном порядке.
 GRAY_CODES = [
     25, 30, 35, 40, 45, 50, 55, 60, 65, 70,
     75, 80, 85, 90, 95, 100, 105, 110, 115, 120,
@@ -9,7 +7,7 @@ GRAY_CODES = [
     175, 180, 185, 190, 195, 200, 205, 210, 215
 ]
 
-NUM_CLASSES = len(GRAY_CODES) + 1  # +1 для фона (класс 0)
+NUM_CLASSES = len(GRAY_CODES) + 1
 
 # === class_id -> gray ===
 class2gray = np.zeros(NUM_CLASSES, dtype=np.uint8)
@@ -18,7 +16,7 @@ for cls_id, gray in enumerate(GRAY_CODES, start=1):
     class2gray[cls_id] = gray
 
 # === gray -> class_id ===
-gray2class = np.zeros(256, dtype=np.int64) - 1  # -1 = "неизвестно"
+gray2class = np.zeros(256, dtype=np.int64) - 1
 gray2class[0] = 0  # фон
 for cls_id, gray in enumerate(GRAY_CODES, start=1):
     gray2class[gray] = cls_id

@@ -1,200 +1,189 @@
+import os
+
 import torch
 import tqdm.auto as tqdm
 import wandb
 import numpy as np
+from torch.cuda.amp import autocast, GradScaler
+from torchmetrics.classification import JaccardIndex
 
 
-# ===== IoU без 0-класса =====
+class EarlyStopping:
+    def __init__(self, patience=7, min_delta=0, path='../models/best_model.pth', verbose=True):
+        """
+        patience: сколько эпох ждать улучшения
+        min_delta: минимальное изменение loss, чтобы считаться улучшением
+        path: куда сохранять лучшую модель
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.path = path
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
 
-def iou_no_bg(logits: torch.Tensor,
-              targets: torch.Tensor,
-              num_classes: int,
-              eps: float = 1e-6) -> float:
-    """
-    Считает mean IoU по классам 1..num_classes-1 (0 — фон, игнорируем).
+        # Создаем папку, если её нет
+        os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    logits:  [B, C, H, W]
-    targets: [B, H, W] или [B, 1, H, W], значения 0..num_classes-1
-    """
-    # предсказанные классы
-    preds = torch.argmax(logits, dim=1)  # [B, H, W]
+    def __call__(self, val_loss, model):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.save_checkpoint(val_loss, model)
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
 
-    # привести таргет к [B, H, W]
-    if targets.ndim == 4 and targets.shape[1] == 1:
-        targets = targets.squeeze(1)
-
-    ious = []
-
-    for c in range(1, num_classes):  # класс 0 (фон) пропускаем
-        pred_c = (preds == c)
-        targ_c = (targets == c)
-
-        # если класс вообще не встречается ни в предсказании, ни в таргете — пропускаем
-        if not targ_c.any() and not pred_c.any():
-            continue
-
-        intersection = (pred_c & targ_c).sum().item()
-        union = pred_c.sum().item() + targ_c.sum().item() - intersection
-
-        if union == 0:
-            continue
-
-        iou_c = intersection / (union + eps)
-        ious.append(iou_c)
-
-    if len(ious) == 0:
-        return 0.0
-
-    return float(sum(ious) / len(ious))
+    def save_checkpoint(self, val_loss, model):
+        if self.verbose:
+            print(f'✅ Val loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
+        torch.save(model.state_dict(), self.path)
+        self.val_loss_min = val_loss
 
 
-def train_epoch(model, optimizer, criterion, device, train_loader, scheduler=None, num_classes=40):
-    """
-    Одна эпоха обучения модели
-    """
-
-    loss_log, iou_log = [], []
-
+def train_epoch(model, optimizer, criterion, device, train_loader, scaler, scheduler=None, num_classes=40):
     model.train()
-    for batch_num, (batch_image, batch_heatmaps) in enumerate(tqdm.tqdm(train_loader, desc="Training Epoch")):
+
+    iou_metric = JaccardIndex(task="multiclass", num_classes=num_classes, ignore_index=0).to(device)
+    loss_log = []
+    pbar = tqdm.tqdm(train_loader, desc="Training Epoch")
+
+    for batch_num, (batch_image, batch_heatmaps) in enumerate(pbar):
         batch_image = batch_image.to(device, non_blocking=True)
         batch_heatmaps = batch_heatmaps.to(device, non_blocking=True)
 
-        # === шаг обучения ===
-        optimizer.zero_grad()
+        # Если таргет [B, 1, H, W], сжимаем до [B, H, W]
+        if batch_heatmaps.ndim == 4:
+            batch_heatmaps = batch_heatmaps.squeeze(1)
 
-        logits = model(batch_image)
+        optimizer.zero_grad(set_to_none=True)
 
-        loss = criterion(logits, batch_heatmaps)
-        loss.backward()
-        optimizer.step()
+        # === AMP ===
+        with autocast(dtype=torch.float16 if device != 'mps' else torch.float32):
+            logits = model(batch_image)
+            loss = criterion(logits, batch_heatmaps)
 
-        # === логирование ===
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        # === Логирование ===
         with torch.no_grad():
-            loss_value = loss.item()
+            loss_val = loss.item()
+            loss_log.append(loss_val)
 
-            loss_log.append(loss_value)
-
-            if num_classes is not None:
-                batch_iou = iou_no_bg(logits, batch_heatmaps, num_classes=num_classes)
-                iou_log.append(batch_iou)
-            else:
-                batch_iou = None
+            batch_iou = iou_metric(logits, batch_heatmaps)
 
             if batch_num % 10 == 0:
-                log_dict = {
-                    "train/batch_loss": loss_value,
+                wandb.log({
+                    "train/batch_loss": loss_val,
+                    "train/batch_IoU": batch_iou.item(),  # .item() чтобы достать число из тензора
                     "train/batch_num": batch_num
-                }
-                if batch_iou is not None:
-                    log_dict["train/batch_IoU"] = batch_iou
-                wandb.log(log_dict)
-
-        if device == "mps" and hasattr(torch, "mps"):
-            torch.mps.empty_cache()
+                })
+                # Обновляем описание прогресс-бара
+                pbar.set_postfix({"loss": f"{loss_val:.4f}", "iou": f"{batch_iou.item():.4f}"})
 
     if scheduler is not None:
         scheduler.step()
 
+    # === Финальный расчет за эпоху ===
     avg_loss = float(np.mean(loss_log))
-    if iou_log:
-        avg_iou = float(np.mean(iou_log))
-    else:
-        avg_iou = 0.0
+    avg_iou = iou_metric.compute().item()
+    iou_metric.reset()
 
-    log_dict = {
+    wandb.log({
         "train/epoch_loss": avg_loss,
-    }
-    if num_classes is not None:
-        log_dict["train/epoch_IoU"] = avg_iou
-
-    wandb.log(log_dict)
+        "train/epoch_IoU": avg_iou
+    })
 
     return avg_loss, avg_iou
 
 
 def val_epoch(model, criterion, device, val_loader, num_classes=40):
-    """
-    Одна эпоха валидации модели
-    """
-
-    loss_log, iou_log = [], []
-
     model.eval()
-    for batch_num, (batch_image, batch_heatmaps) in enumerate(tqdm.tqdm(val_loader, desc="Validation Epoch")):
-        batch_image = batch_image.to(device, non_blocking=True)
-        batch_heatmaps = batch_heatmaps.to(device, non_blocking=True)
 
-        # === предсказание модели ===
-        with torch.no_grad():
-            logits = model(batch_image)
-            loss = criterion(logits, batch_heatmaps)
-        loss_log.append(loss.item())
+    iou_metric = JaccardIndex(task="multiclass", num_classes=num_classes, ignore_index=0).to(device)
+    loss_log = []
+    pbar = tqdm.tqdm(val_loader, desc="Validation Epoch")
 
-        if num_classes is not None:
-            batch_iou = iou_no_bg(logits, batch_heatmaps, num_classes=num_classes)
-            iou_log.append(batch_iou)
-        else:
-            batch_iou = None
+    with torch.no_grad():
+        for batch_num, (batch_image, batch_heatmaps) in enumerate(pbar):
+            batch_image = batch_image.to(device, non_blocking=True)
+            batch_heatmaps = batch_heatmaps.to(device, non_blocking=True)
 
-        # === логирование ===
-        if batch_num % 10 == 0:
-            log_dict = {
-                "val/batch_loss": loss.item(),
-                "val/val_batch_num": batch_num
-            }
-            if batch_iou is not None:
-                log_dict["val/batch_IoU"] = batch_iou
-            wandb.log(log_dict)
+            if batch_heatmaps.ndim == 4:
+                batch_heatmaps = batch_heatmaps.squeeze(1)
+
+            # === AMP ===
+            with autocast(dtype=torch.float16 if device != 'mps' else torch.float32):
+                logits = model(batch_image)
+                loss = criterion(logits, batch_heatmaps)
+
+            loss_log.append(loss.item())
+
+            # Обновляем метрику
+            batch_iou = iou_metric(logits, batch_heatmaps)
+
+            if batch_num % 10 == 0:
+                wandb.log({
+                    "val/batch_loss": loss.item(),
+                    "val/batch_IoU": batch_iou.item(),
+                    "val/val_batch_num": batch_num
+                })
 
     avg_loss = float(np.mean(loss_log))
-    if iou_log:
-        avg_iou = float(np.mean(iou_log))
-    else:
-        avg_iou = 0.0
+    avg_iou = iou_metric.compute().item()
+    iou_metric.reset()
 
-    log_dict = {
+    wandb.log({
         "val/epoch_loss": avg_loss,
-    }
-    if num_classes is not None:
-        log_dict["val/epoch_IoU"] = avg_iou
-
-    wandb.log(log_dict)
+        "val/epoch_IoU": avg_iou
+    })
 
     return avg_loss, avg_iou
 
 
 def train_model(model, optimizer, criterion, scheduler, train_loader, val_loader, device, n_epoch):
-    """
-    Запуск обучения модели
-    """
-
     wandb.watch(model, log="all", log_freq=10)
+    scaler = GradScaler()
+
+    early_stopping = EarlyStopping(
+        patience=7,  # Ждем 7 эпох
+        min_delta=0.001,  # Минимальное улучшение лосса
+        path="../models/best_model.pth"
+    )
 
     for epoch in tqdm.trange(n_epoch, desc="Training Progress"):
-        # === обучение и валидация ===
-        train_loss = train_epoch(model, optimizer, criterion, device, train_loader, scheduler)
-        val_loss = val_epoch(model, criterion, device, val_loader)
+        train_loss, train_iou = train_epoch(model, optimizer, criterion, device, train_loader, scaler, scheduler)
+        val_loss, val_iou = val_epoch(model, criterion, device, val_loader)
 
-        # === логирование ===
-        wandb.log({
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-        })
+        # === Проверка Early Stopping ===
+        early_stopping(val_loss, model)
 
-        # === сохранение чекпоинта ===
+        if early_stopping.early_stop:
+            print("🛑 Ранняя остановка! Модель перестала обучаться.")
+            break
+
+        # === Сохранение чекпоинта ===
         try:
-            model.eval()
+            checkpoint_path = f"../models/checkpoint_{epoch}.pth"
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "epoch": epoch
-            }, f"../models/checkpoint_{epoch}.pth")
-
-            print("✅ Чекпойнт модели сохранён (.pth)")
+                "epoch": epoch,
+                "val_iou": val_iou
+            }, checkpoint_path)
         except Exception as e:
-            print(f"Ошибка при сохранении чекпоинта: {e}")
+            print(f"Error saving checkpoint: {e}")
+
 
     # === Сохранение модели через ONNX ===
     try:

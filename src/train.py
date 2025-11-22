@@ -1,12 +1,7 @@
-import os
 import warnings
-
-from torch.nn import CrossEntropyLoss
-
 warnings.filterwarnings("ignore")
 
 import wandb
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,7 +12,7 @@ import matplotlib.pyplot as plt
 
 import dataset
 import train_utils
-from model import SegModelUnetPlusPlusConvNext, CombinedLoss
+from model import UnetPlusPlusEffNet, DiceCE, UnetSegFormer
 
 
 def main() -> None:
@@ -43,10 +38,10 @@ def main() -> None:
         val_transforms=val_transform,
     )
     train_loader = DataLoader(
-        train_dataset, batch_size=8, shuffle=True, pin_memory=True, num_workers=5
+        train_dataset, batch_size=8, shuffle=True, pin_memory=True, num_workers=4, persistent_workers=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=8, shuffle=False, pin_memory=True, num_workers=5
+        val_dataset, batch_size=8, shuffle=False, pin_memory=True, num_workers=4, persistent_workers=True
     )
 
     # === Проверка батча ===
@@ -87,8 +82,8 @@ def main() -> None:
     config = {
         "project": "rosneft-segmentation",
         "experiment": "unet++&effnet_b0",
-        "epochs": 10,
-        "lr": 1e-4,
+        "epochs": 30,
+        "lr": 3e-4,
         "optimizer": "AdamW",
         "criterion": "Dice&CE",
         "scheduler": "CosineAnnealingWarmRestarts",
@@ -99,7 +94,7 @@ def main() -> None:
         )
     }
 
-    model = SegModelUnetPlusPlusConvNext(num_classes=40)
+    model = UnetPlusPlusEffNet(num_classes=40)
     model = model.to(config["device"], non_blocking=True)
 
     optimizer = torch.optim.AdamW(
@@ -117,10 +112,10 @@ def main() -> None:
                 "lr": config["lr"],
             },
         ],
-        weight_decay=1e-4,
+        weight_decay=1e-2,
     )
 
-    criterion = CombinedLoss(ce_weight=0.5)
+    criterion = DiceCE(ce_weight=0.5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
         T_0=5,

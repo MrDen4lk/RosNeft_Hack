@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import segmentation_models_pytorch as smp
 import torch
 
-class SegModelUnetPlusPlusConvNext(nn.Module):
+class UnetPlusPlusEffNet(nn.Module):
     def __init__(self, num_classes: int, in_channels: int = 3):
         super().__init__()
         self.backbone = smp.UnetPlusPlus(
@@ -11,6 +11,7 @@ class SegModelUnetPlusPlusConvNext(nn.Module):
             encoder_weights="imagenet",
             in_channels=in_channels,
             classes=num_classes,
+            decoder_attention_type="scse"
         )
 
     def forward(self, x):
@@ -18,7 +19,23 @@ class SegModelUnetPlusPlusConvNext(nn.Module):
         return logits
 
 
-# === Dice + CE для мультикласса ===
+class UnetSegFormer(nn.Module):
+    def __init__(self, num_classes: int, in_channels: int = 3):
+        super().__init__()
+        self.backbone = smp.Unet(
+            encoder_name="mit_b3",
+            encoder_weights="imagenet",
+            in_channels=in_channels,
+            classes=num_classes,
+            decoder_use_batchnorm=True,
+        )
+
+    def forward(self, x):
+        logits = self.backbone(x)        # [B, C, H, W]
+        return logits
+
+
+# === DiceCE ===
 
 class DiceLoss(nn.Module):
     def __init__(self, smooth: float = 1.0):
@@ -28,8 +45,7 @@ class DiceLoss(nn.Module):
     def forward(self, logits, targets):
         """
         logits:  [B, C, H, W]
-        targets: [B, H, W]   (индексы классов)
-                 или [B, 1, H, W]
+        targets: [B, H, W] или [B, 1, H, W]
         """
         num_classes = logits.shape[1]
 
@@ -54,7 +70,7 @@ class DiceLoss(nn.Module):
         return 1 - dice.mean()
 
 
-class CombinedLoss(nn.Module):
+class DiceCE(nn.Module):
     def __init__(self, ce_weight: float = 0.5):
         super().__init__()
         self.ce = nn.CrossEntropyLoss()
@@ -69,6 +85,6 @@ class CombinedLoss(nn.Module):
             targets_ce = targets.long()
 
         ce_loss = self.ce(logits, targets_ce)
-        dice_loss = self.dice(logits, targets)   # тут внутри уже есть squeeze/long
+        dice_loss = self.dice(logits, targets)
 
         return self.ce_weight * ce_loss + (1 - self.ce_weight) * dice_loss
